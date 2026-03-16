@@ -2,28 +2,21 @@ from ..Sensor import Sensor
 import cv2
 import os
 import platform
+import numpy as np
 
 try:
     import gsdevice
 except:
     pass
 
-def resize_crop_mini(image, width, height):
-    """
-    Resize and center-crop image to given width and height.
-    """
-    h, w = image.shape[:2]
-
-    # Resize while keeping aspect ratio
-    scale = max(width / w, height / h)
-    resized = cv2.resize(image, (int(w * scale), int(h * scale)))
-
-    # Center crop
-    h_resized, w_resized = resized.shape[:2]
-    x_start = (w_resized - width) // 2
-    y_start = (h_resized - height) // 2
-
-    return resized[y_start:y_start + height, x_start:x_start + width]
+def resize_crop_mini(img, imgw, imgh):
+    # remove 1/7th of border from each size
+    border_size_x, border_size_y = int(img.shape[0] * (1 / 7)), int(np.floor(img.shape[1] * (1 / 7)))
+    # keep the ratio the same as the original image size
+    img = img[border_size_x+2:img.shape[0] - border_size_x, border_size_y:img.shape[1] - border_size_y]
+    # final resize for 3d
+    img = cv2.resize(img, (imgw, imgh))
+    return img
 
 class GelsightMini(Sensor):
     """
@@ -90,5 +83,5 @@ class GelsightMini(Sensor):
             
             image = resize_crop_mini(image, 320, 240)
 
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            return cv2.flip(image, 1)
+            # return cv2.flip(image, 1)
+            return image
