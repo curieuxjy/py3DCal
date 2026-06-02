@@ -117,6 +117,8 @@ python examples/stream_digit_depth_3d.py --serial D21424 --no-render
 py3DCal TouchNet 과 NeuralFeels 의 tactile transformer(DPT, `dpt_real.p` / `dpt_sim.p`)를 같은 DIGIT 입력으로 실시간 비교합니다.
 DPT 는 `timm` + 로컬 `examples/dpt_lite/`(neuralfeels 에서 복사한 자체 완결 모델 코드)로 **가볍게** 구동되며, neuralfeels 전체 설치는 필요 없습니다.
 
+> 두 모델의 구조(레이어 흐름) 비교는 Mermaid 다이어그램으로 [`ARCHITECTURE.md`](ARCHITECTURE.md) 에 정리해 두었습니다.
+
 ```bash
 conda activate py3dcal
 pip install timm einops   # DPT 비교용 추가 의존성(최초 1회)
