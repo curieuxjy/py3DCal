@@ -106,8 +106,12 @@ def frame_to_tensor(frame):
     return t.permute(2, 0, 1).float().div_(255.0)
 
 
-def compute_depth(model, frame, blank_t, device, use_fp16=False):
+def compute_depth(model, frame, blank_t, device, use_fp16=False, px_per_mm=None):
     """최신 프레임 -> 깊이맵(ndarray). get_depthmap 과 동일한 수치 파이프라인.
+
+    TouchNet 은 표면 기울기(dz/dx, dz/dy)를 출력하고 fast_poisson 이 이를 적분한다.
+    학습 타깃 기울기가 '픽셀' 단위(구 반지름을 px 로 둠)이므로 적분된 깊이도 '픽셀'
+    단위다. px_per_mm 가 주어지면 depth_mm = depth_px / px_per_mm 로 mm 로 변환한다.
 
     use_fp16=True 면 모델 forward 를 FP16 autocast + channels_last 로 실행해
     추론을 ~2배 빠르게 한다(실시간 시각화에는 정밀도 영향 무시 가능).
@@ -125,7 +129,10 @@ def compute_depth(model, frame, blank_t, device, use_fp16=False):
             out = model(aug)
     out = out.squeeze(0).permute(1, 2, 0).float().cpu().numpy()
     depth = fast_poisson(out[:, :, 0], out[:, :, 1])
-    return np.clip(-depth, a_min=0, a_max=None)
+    depth = np.clip(-depth, a_min=0, a_max=None)         # 픽셀 단위 상대 깊이
+    if px_per_mm:
+        depth = depth / px_per_mm                        # -> mm
+    return depth
 
 
 def capture_blank(grabber, n_avg=10, settle=0.6):
@@ -166,23 +173,38 @@ def main():
                         help="렌더 상한 fps(0=무제한). CPU 점유 줄이고 싶을 때.")
     parser.add_argument("--no-fp16", action="store_true",
                         help="FP16 가속을 끄고 FP32 로 추론(기본은 cuda 에서 FP16 사용).")
+    parser.add_argument("--px-per-mm", type=float, default=15.0,
+                        help="깊이(px)->mm 변환 계수. 캘리브레이션 metadata.json 의 px_per_mm 값을 쓰면 정확. "
+                             "기본 15.0 은 DIGIT 근사값(센싱면 ~16mm/240px). 0 으로 주면 변환 없이 상대단위 표시.")
     parser.add_argument("--headless", type=int, default=0, metavar="N",
                         help="디스플레이 없이 N프레임 처리 후 스냅샷 저장(점검용).")
     parser.add_argument("--outdir", default="./digit_check_results", help="스냅샷 저장 위치.")
+    parser.add_argument("--no-render", action="store_true",
+                        help="창을 전혀 띄우지 않고 깊이 추정값만 콘솔에 계속 출력(최대 fps 측정용).")
+    parser.add_argument("--print-n", type=int, default=8,
+                        help="--no-render 에서 매 프레임 출력할 깊이 표본 개수. 기본 8.")
     args = parser.parse_args()
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     use_fp16 = (device == "cuda") and (not args.no_fp16)
     if device == "cuda":
         torch.backends.cudnn.benchmark = True  # 고정 입력크기 conv 알고리즘 autotune
+    px_per_mm = args.px_per_mm if args.px_per_mm and args.px_per_mm > 0 else None
+    unit = "mm" if px_per_mm else "rel"  # 축 단위 표기
     print(f"디바이스: {device} (cuda available: {torch.cuda.is_available()}) | fp16: {use_fp16}")
+    if px_per_mm:
+        print(f"깊이 단위: mm (px_per_mm={px_per_mm}; 정확한 값은 캘리브레이션 metadata.json 참고)")
+    else:
+        print("깊이 단위: 상대값(rel). --px-per-mm 를 주면 mm 로 표시됩니다.")
 
+    no_render = args.no_render
     headless = args.headless > 0
-    if headless:
-        matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    if args.mode == "3d":
-        from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+    if not no_render:
+        if headless:
+            matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        if args.mode == "3d":
+            from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
     serial = args.serial or detect_first_serial()
     if not serial:
@@ -216,7 +238,49 @@ def main():
 
     # 첫 프레임/깊이맵으로 격자/아티스트 초기화
     frame0 = grabber.latest()
-    depth0 = compute_depth(model, frame0, blank_t, device, use_fp16)
+    depth0 = compute_depth(model, frame0, blank_t, device, use_fp16, px_per_mm)
+
+    # --no-render: 창 없이 깊이 추정값만 콘솔에 계속 출력(최대 fps 측정/실시간 변화 확인용)
+    if no_render:
+        n = max(1, args.print_n)
+        print(f"no-render 모드: 창 없이 깊이값만 출력합니다. (Ctrl-C 종료)")
+        print(f"표본은 깊이맵 중앙 가로선에서 {n}점을 뽑습니다. max/mean 과 함께 실시간으로 바뀝니다.\n")
+        min_dt = (1.0 / args.target_fps) if args.target_fps > 0 else 0.0
+        frame_count = 0
+        t0 = time.time()
+        last = t0
+        try:
+            while True:
+                frame = grabber.latest()
+                if frame is None:
+                    if grabber._err:
+                        raise grabber._err
+                    time.sleep(0.005)
+                    continue
+                depth = compute_depth(model, frame, blank_t, device, use_fp16, px_per_mm)
+                frame_count += 1
+                fps = frame_count / (time.time() - t0)
+                h, w = depth.shape
+                idxs = np.linspace(0, w - 1, n).astype(int)
+                row = depth[h // 2, idxs]
+                sample = " ".join(f"{v:6.3f}" for v in row)
+                print(f"[{fps:6.1f} fps] max={depth.max():6.3f} mean={depth.mean():6.4f} {unit} | center[{sample}]")
+                if min_dt:
+                    dt = time.time() - last
+                    if dt < min_dt:
+                        time.sleep(min_dt - dt)
+                last = time.time()
+        except KeyboardInterrupt:
+            print("\n중단됨(Ctrl-C).")
+        finally:
+            grabber.stop()
+            time.sleep(0.05)
+            try:
+                sensor.disconnect()
+            except Exception:
+                pass
+            print("센서 연결 해제 완료.")
+        return
 
     state = {"quit": False, "reblank": False}
 
@@ -259,16 +323,17 @@ def main():
 
     if args.mode in ("2d", "all"):
         ax2d = fig.add_subplot(1, ncols, col)
-        ax2d.set_title("depth (2D)")
+        ax2d.set_title(f"depth (2D) [{unit}]")
         ax2d.axis("off")
         im = ax2d.imshow(depth0, cmap="viridis", vmin=0, vmax=z_ema)
-        fig.colorbar(im, ax=ax2d, fraction=0.046, pad=0.04)
+        cbar = fig.colorbar(im, ax=ax2d, fraction=0.046, pad=0.04)
+        cbar.set_label(f"depth ({unit})")
         col += 1
 
     if need_3d:
         ax = fig.add_subplot(1, ncols, col, projection="3d")
         ax.set_title("depth (3D)")
-        ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("depth")
+        ax.set_xlabel("x (px)"); ax.set_ylabel("y (px)"); ax.set_zlabel(f"depth ({unit})")
         col += 1
 
     if not headless:
@@ -289,7 +354,7 @@ def main():
                 time.sleep(0.005)
                 continue
 
-            depth = compute_depth(model, frame, blank_t, device, use_fp16)
+            depth = compute_depth(model, frame, blank_t, device, use_fp16, px_per_mm)
 
             # z 스케일: 고정값 없으면 EMA 로 부드럽게 추종
             if args.zmax is not None:
@@ -316,7 +381,7 @@ def main():
             frame_count += 1
             if frame_count % 20 == 0:
                 fps = frame_count / (time.time() - t0)
-                print(f"  frame {frame_count} | depth max={depth.max():.3f} | render ~{fps:.1f} fps")
+                print(f"  frame {frame_count} | depth max={depth.max():.3f} {unit} | render ~{fps:.1f} fps")
 
             if headless:
                 if frame_count >= args.headless:

@@ -37,3 +37,5 @@ depthmap.png
 .vscode/
 .idea/
 test.py
+
+digit_check_results/
