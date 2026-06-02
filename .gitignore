@@ -1,14 +1,39 @@
 # All pycache files
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 
 # Distribution / packaging
 build/
 dist/
+*.egg-info/
 py3dcal.egg-info/
+.eggs/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+.conda/
+
+# py3DCal runtime artifacts
+# Data collected by Calibrator.probe() / probe_reskin()
+sensor_calibration_data/
+# Outputs written by train_model() to the current working directory
+weights.pth
+losses.csv
+# Pretrained weights downloaded from Zenodo (TouchNet / MagNet load_pretrained=True)
+*_pretrained_weights.pth
+# Depthmap image saved by save_2d_depthmap()
+depthmap.png
+
+# Claude Code
+.claude/
 
 # Misc files
 .DS_Store
 .vscode/
+.idea/
 test.py
-
