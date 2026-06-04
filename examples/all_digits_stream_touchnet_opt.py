@@ -128,6 +128,85 @@ def _camera_ok(sensor, n=5):
         return False
 
 
+# DIGIT QVGA(320x240) 스트림이 디스크립터로 실제 지원하는 프레임 간격(fps).
+# 15 같은 값은 '지원되지 않아' uvcvideo 가 임의로 30/60 으로 반올림한다 → 대역폭이
+# 비결정적으로 60 까지 튀어 다중 동시 스트리밍에서 부분 섞임이 재발한다.
+QVGA_SUPPORTED_FPS = (30, 60)
+
+
+def _snap_cam_fps(requested):
+    """요청 fps 를 QVGA 가 실제 지원하는 값으로 스냅. (지원 외 값은 드라이버가 무시함)"""
+    if requested in QVGA_SUPPORTED_FPS:
+        return requested, False
+    # 요청값 이하의 가장 큰 지원값(대역폭을 줄이는 방향). 없으면 최소 지원값.
+    below = [v for v in QVGA_SUPPORTED_FPS if v <= requested]
+    snapped = max(below) if below else min(QVGA_SUPPORTED_FPS)
+    return snapped, True
+
+
+def _measure_fps(sensor, n=30):
+    """포맷 적용 후 카메라가 실제로 내보내는 fps 를 측정(요청대로 반영됐는지 검증)."""
+    t = time.time()
+    k = 0
+    for _ in range(n):
+        f = sensor.capture_image()
+        if f is not None and f.size:
+            k += 1
+    dt = time.time() - t
+    return (k / dt) if dt > 0 else 0.0
+
+
+def _force_qvga_fps(sensor_digit, dev_name, fps, width=320, height=240):
+    """프레임 간격을 '실제로' fps 로 고정한다(다중 동시 스트리밍 대역폭 축소의 핵심).
+
+    이 DIGIT uvcvideo 드라이버의 두 가지 함정:
+      (1) OpenCV 의 CAP_PROP_FPS 설정을 '무시'한다(=cap.set 으로는 못 바꿈).
+      (2) S_FMT(=set_resolution)가 프레임 간격을 포맷 기본값(60)으로 '리셋'한다.
+    따라서 간격을 유지하는 유일한 방법은: 장치를 '닫은 상태'에서 v4l2-ctl 로 포맷+간격을
+    함께 박고, 그 뒤 S_FMT 를 일으키지 않는 plain open 으로 다시 여는 것(프로브로 확인).
+
+    digit 이 연 내부 cv2.VideoCapture(_Digit__dev)를 닫고 새 핸들로 교체한다.
+    성공 여부(bool)와 get-parm readback 문자열을 반환.
+    """
+    import shutil
+    import subprocess
+    cap = getattr(sensor_digit, "_Digit__dev", None)
+    if cap is None or not dev_name or shutil.which("v4l2-ctl") is None:
+        return False, "재오픈 불가(cap/dev/v4l2-ctl 없음)"
+    try:
+        cap.release()
+    except Exception:
+        pass
+    time.sleep(0.3)  # 닫힘이 커널에 반영될 시간(너무 빠른 재오픈은 select timeout 유발)
+    try:
+        subprocess.run(["v4l2-ctl", "-d", dev_name,
+                        f"--set-fmt-video=width={width},height={height},pixelformat=YUYV",
+                        f"--set-parm={fps}"],
+                       capture_output=True, text=True, timeout=5)
+        out = subprocess.run(["v4l2-ctl", "-d", dev_name, "--get-parm"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except Exception as e:
+        return False, str(e)
+    time.sleep(0.1)
+    newcap = cv2.VideoCapture(dev_name, cv2.CAP_V4L2)
+    if not newcap.isOpened():
+        return False, "재오픈 실패"
+    # plain open 은 VGA(640x480)로 열린다 → QVGA 를 강제한다. 장치 간격이 위에서 30 으로
+    # 박혀 있으므로, 이 S_FMT 는 (60 으로 리셋하지 않고) 30 을 유지한다(프로브 [B] 확인).
+    newcap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    newcap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    try:
+        newcap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    except Exception:
+        pass
+    sensor_digit._Digit__dev = newcap
+    msg = "?"
+    for line in out.splitlines():
+        if "Frames per second" in line:
+            msg = line.split(":", 1)[1].strip()
+    return True, msg
+
+
 class FrameGrabber(threading.Thread):
     """센서별 백그라운드 캡처 스레드(최신 프레임만 유지).
 
@@ -215,9 +294,10 @@ def main():
                          "노이즈가 늘 수 있음. 컨트롤러 대역폭이 부족하고 fps 도 못 낮출 때만.")
     ap.add_argument("--no-mjpeg", dest="mjpeg", action="store_false",
                     help="MJPEG 비활성(기본). 무압축 YUYV 사용 → 압축 잡음 없음.")
-    ap.add_argument("--cam-fps", type=int, default=15,
-                    help="카메라 캡처 FPS(기본 15). 낮을수록 USB 대역폭↓ → 다중 동시 섞임 방지. "
-                         "센서가 1~2대면 30~60 으로 올려도 됨.")
+    ap.add_argument("--cam-fps", type=int, default=30,
+                    help="카메라 캡처 FPS. DIGIT QVGA 는 30/60 만 지원하므로 그 외 값은 자동으로 "
+                         "스냅된다(15 등 비지원 값은 드라이버가 임의로 30/60 으로 반올림 → 대역폭이 "
+                         "비결정적으로 튀어 섞임 재발). 다중 동시면 30 권장, 1~2대면 60 가능.")
     ap.add_argument("--diff-thresh", type=float, default=0.04,
                     help="입력 dead-band(0~1). |frame-blank| 가 이보다 작으면 0 처리 → 무접촉 노이즈 "
                          "가 Poisson 적분으로 깊이가 되는 것을 차단. 0이면 비활성. (≈0.04=10/255)")
@@ -258,6 +338,14 @@ def main():
         if args.mode == "3d":
             from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
+    # QVGA 가 실제 지원하는 fps 로 스냅(비지원 값은 드라이버가 무시 → 대역폭 비결정적).
+    if not args.mjpeg:
+        snapped, changed = _snap_cam_fps(args.cam_fps)
+        if changed:
+            print(f"[주의] --cam-fps {args.cam_fps} 는 DIGIT QVGA 비지원값 → {snapped} 으로 스냅 "
+                  f"(지원: {QVGA_SUPPORTED_FPS}). 비지원 값은 드라이버가 임의 반올림해 섞임이 재발합니다.")
+            args.cam_fps = snapped
+
     serials = args.serials if args.serials else detect_serials()
     if not serials:
         print("[오류] DIGIT 센서를 찾을 수 없습니다. --serials 로 지정하세요."); sys.exit(1)
@@ -279,24 +367,36 @@ def main():
     for serial in serials:
         try:
             sensor = DIGIT(serial); sensor.connect()
-            # 대역폭 축소(MJPEG/fps) + 버퍼=1 — 다중 동시 스트리밍 시 부분 섞임 완화.
-            info = _configure_camera(sensor.sensor, args.cam_fps, args.mjpeg)
-            if args.mjpeg and not _camera_ok(sensor):
-                # MJPEG 미지원/오작동 → YUYV 로 폴백(재연결 후 재설정).
-                print(f"  [{serial}] MJPEG 미지원으로 보임 → YUYV 폴백")
-                try: sensor.disconnect()
-                except Exception: pass
-                sensor = DIGIT(serial); sensor.connect()
-                info = _configure_camera(sensor.sensor, args.cam_fps, mjpeg=False)
-            sensor.flush_frames(args.warmup)
             dev = getattr(sensor.sensor, "dev_name", "?")
+            parm_ok, parm_msg = (False, "")
+            if args.mjpeg:
+                # 대역폭 축소(MJPEG) + 버퍼=1.
+                _configure_camera(sensor.sensor, args.cam_fps, mjpeg=True)
+                if not _camera_ok(sensor):
+                    print(f"  [{serial}] MJPEG 미지원으로 보임 → YUYV 폴백")
+                    try: sensor.disconnect()
+                    except Exception: pass
+                    sensor = DIGIT(serial); sensor.connect()
+                    dev = getattr(sensor.sensor, "dev_name", "?")
+                    parm_ok, parm_msg = _force_qvga_fps(sensor.sensor, dev, args.cam_fps)
+            else:
+                # 핵심: 닫힌 상태 set-parm + S_FMT 없는 재오픈으로 프레임 간격을 실제로 고정한다.
+                # (이 드라이버는 OpenCV CAP_PROP_FPS 를 무시하고, S_FMT 는 간격을 60 으로 리셋함)
+                parm_ok, parm_msg = _force_qvga_fps(sensor.sensor, dev, args.cam_fps)
+            sensor.flush_frames(args.warmup)
+            # 스트리밍 시작 후 '실제' fps 측정 — 대역폭 축소가 정말 반영됐는지 검증.
+            act_fps = _measure_fps(sensor, n=30)
             dev_names[serial] = dev
             g = FrameGrabber(sensor, serial); g.start()
             sensors[serial] = sensor
             grabbers[serial] = g
-            # 드라이버의 fps/fourcc readback 은 스트리밍 전이라 부정확할 수 있어 요청값을 표기.
-            fmt = f"{'MJPG' if args.mjpeg else 'YUYV'}@~{args.cam_fps}fps"
-            print(f"  [연결됨] {serial} -> {dev}  [{fmt}]")
+            drv = parm_msg if parm_msg else "?"
+            fmt = f"{'MJPG' if args.mjpeg else 'YUYV'}@{args.cam_fps}req"
+            warn = ""
+            if not args.mjpeg and act_fps > args.cam_fps * 1.4:
+                warn = (f"  <- [경고] 실측 {act_fps:.0f}fps: 대역폭 축소 미반영 → 섞임 위험"
+                        + ("" if parm_ok else f" (v4l2 설정 실패: {parm_msg})"))
+            print(f"  [연결됨] {serial} -> {dev}  [{fmt}, drv={drv}, 실측 ~{act_fps:.0f}fps]{warn}")
         except Exception as e:
             print(f"  [연결 실패] {serial}: {e}")
     if not sensors:
